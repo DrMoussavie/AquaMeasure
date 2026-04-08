@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environnements virtuels
+.venv/
+venv/
+env/
+
+# Données générées par l'app
+camera_parameters/
+/tmp/stereo_calib/
+debug_corners.png
+
+# Ancienne version
+stereo_app.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
