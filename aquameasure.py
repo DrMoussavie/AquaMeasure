@@ -248,13 +248,15 @@ class CalibrationWorker(QObject):
             np.save('camera_parameters/R.npy',     R)
             np.save('camera_parameters/T.npy',     T)
             np.save('camera_parameters/F.npy',     F)
+            np.save('camera_parameters/stereo_rmse.npy', np.array(rmse3))
             with open('camera_parameters/videos.txt', 'w') as f:
                 f.write(self.left_video  + '\n')
                 f.write(self.right_video + '\n')
-            self.log.emit("  mtx1.npy  dist1.npy  → caméra gauche")
-            self.log.emit("  mtx2.npy  dist2.npy  → caméra droite")
-            self.log.emit("  R.npy  T.npy  F.npy  → stéréo (rotation, translation, fondamentale)")
-            self.log.emit("  videos.txt            → chemins des vidéos")
+            self.log.emit("  mtx1.npy  dist1.npy       → caméra gauche")
+            self.log.emit("  mtx2.npy  dist2.npy       → caméra droite")
+            self.log.emit("  R.npy  T.npy  F.npy       → stéréo (rotation, translation, fondamentale)")
+            self.log.emit(f"  stereo_rmse.npy          → {rmse3:.4f} pixels")
+            self.log.emit("  videos.txt                → chemins des vidéos")
             self.log.emit("✓ Paramètres enregistrés")
 
             # ── Sauvegarde des images de vérification ──────────────────────
@@ -1438,6 +1440,7 @@ class MeasureTab(QWidget):
 
         # Paramètres caméra
         self.mtx1 = self.dist1 = self.mtx2 = self.dist2 = None
+        self.stereo_rmse: float | None = None
         self.R    = self.T = None
 
         # Mesure — step contrôle le placement de nouveaux points
@@ -1541,6 +1544,19 @@ class MeasureTab(QWidget):
         ctrl_row.addWidget(self.distance_label)
         layout.addLayout(ctrl_row)
 
+        # ── Incertitude de mesure ─────────────────────────────────────────────
+        self.uncertainty_label = QLabel()
+        self.uncertainty_label.setFont(QFont("Segoe UI", 10))
+        self.uncertainty_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.uncertainty_label.hide()
+        layout.addWidget(self.uncertainty_label)
+
+        self.precision_label = QLabel()
+        self.precision_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.precision_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.precision_label.hide()
+        layout.addWidget(self.precision_label)
+
         # ── Timer lecture ─────────────────────────────────────────────────────
         self._timer = QTimer()
         self._timer.setInterval(40)   # ~25 fps
@@ -1604,6 +1620,9 @@ class MeasureTab(QWidget):
         self.dist2 = np.load('camera_parameters/dist2.npy')
         self.R     = np.load('camera_parameters/R.npy')
         self.T     = np.load('camera_parameters/T.npy')
+        rmse_path  = 'camera_parameters/stereo_rmse.npy'
+        self.stereo_rmse = float(np.load(rmse_path)) \
+            if os.path.exists(rmse_path) else None
 
         if self._cap_left:
             self._cap_left.release()
@@ -1724,6 +1743,7 @@ class MeasureTab(QWidget):
             return
         if self.mtx1 is None:
             return
+
         RT1  = np.concatenate([np.eye(3), [[0], [0], [0]]], axis=-1)
         P1   = self.mtx1 @ RT1
         RT2  = np.concatenate([self.R, self.T], axis=-1)
@@ -1731,8 +1751,49 @@ class MeasureTab(QWidget):
         p3dA = DLT(P1, P2, list(left_h[0]), list(right_h[0]))
         p3dB = DLT(P1, P2, list(left_h[1]), list(right_h[1]))
         dist = np.linalg.norm(p3dB - p3dA)
-        self.distance_label.setText(f"Distance A→B : {dist:.4f} mm")
+
+        self.distance_label.setText(f"Distance A→B : {dist:.1f} mm")
         self.distance_label.show()
+
+        # ── Estimation d'incertitude ───────────────────────────────────────
+        if self.stereo_rmse is not None:
+            f_px     = float(self.mtx1[0, 0])          # focale en pixels
+            B_mm     = float(abs(self.T[0, 0]))        # baseline en mm
+            z_A      = float(p3dA[2])
+            z_B      = float(p3dB[2])
+            z_mean   = (z_A + z_B) / 2.0
+
+            # Propagation d'erreur : σZ = Z² × rmse / (f × B)
+            sigma_Z        = (z_mean ** 2) * self.stereo_rmse / max(f_px * B_mm, 1e-6)
+            sigma_dist     = float(np.sqrt(2)) * sigma_Z
+            rel_err        = sigma_dist / max(dist, 1e-6)
+
+            self.distance_label.setText(
+                f"Distance A→B : {dist:.1f} mm  ±  {sigma_dist:.1f} mm")
+
+            self.uncertainty_label.setText(
+                f"Depth: ~{z_mean:.0f} mm  |  "
+                f"Focal: {f_px:.0f} px  |  "
+                f"Baseline: {B_mm:.1f} mm  |  "
+                f"Stereo RMSE: {self.stereo_rmse:.3f} px")
+            self.uncertainty_label.show()
+
+            if rel_err < 0.05:
+                color, tag = "#4caf50", "✓ High precision"
+            elif rel_err < 0.15:
+                color, tag = "#ff9800", "⚠ Medium precision"
+            else:
+                color, tag = "#f44336", "✗ Low precision — move cameras closer"
+
+            self.precision_label.setText(
+                f"<span style='color:{color};'>{tag}</span>  "
+                f"({rel_err*100:.1f}% relative uncertainty)  —  "
+                "Uncertainty increases with distance from cameras")
+            self.precision_label.setTextFormat(Qt.TextFormat.RichText)
+            self.precision_label.show()
+        else:
+            self.uncertainty_label.hide()
+            self.precision_label.hide()
 
     def _update_hint(self):
         self.hint_label.setText(_STEPS[min(self._step, 4)])
@@ -1743,6 +1804,8 @@ class MeasureTab(QWidget):
         self.img_right.clear_handles()
         self.hint_label.setText(_STEPS[0])
         self.distance_label.hide()
+        self.uncertainty_label.hide()
+        self.precision_label.hide()
         self.status_label.hide()
 
     # ── Nuage de points 3D ────────────────────────────────────────────────────
