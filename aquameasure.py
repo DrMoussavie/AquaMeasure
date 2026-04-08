@@ -556,9 +556,56 @@ class CalibrationTab(QWidget):
 # ── Signaux thread → UI ────────────────────────────────────────────────────────
 
 class _PCSignals(QObject):
-    status   = pyqtSignal(str)
-    finished = pyqtSignal()
-    error    = pyqtSignal(str)
+    status      = pyqtSignal(str)
+    finished    = pyqtSignal()
+    error       = pyqtSignal(str)
+    image_ready = pyqtSignal(object)   # émet un np.ndarray BGR pour affichage Qt
+
+
+# ── Fenêtre de visualisation disparité ────────────────────────────────────────
+
+class DisparityWindow(QWidget):
+    """Fenêtre indépendante affichant le composite disparité/rectification."""
+
+    def __init__(self, bgr_image: np.ndarray, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("AquaMeasure — Disparity & Rectification Check")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        # Barre d'info en haut
+        info = QLabel(
+            "Lignes épipolaires vertes alignées horizontalement → rectification OK   |   "
+            "Gradient cohérent sur la carte → calibration stéréo OK   |   "
+            "Noir = pas de profondeur")
+        info.setStyleSheet("color:#aaa; font-size:10px;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        pix = _cv_to_pixmap(bgr_image)
+        lbl.setPixmap(pix)
+        lbl.setFixedSize(pix.size())
+
+        scroll.setWidget(lbl)
+        layout.addWidget(scroll)
+
+        # Taille fenêtre : max 90 % de l'écran
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(bgr_image.shape[1] + 24, int(screen.width()  * 0.92)),
+                    min(bgr_image.shape[0] + 80,  int(screen.height() * 0.88)))
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
 
 
 # ── ZoomPanel ─────────────────────────────────────────────────────────────────
@@ -1492,6 +1539,7 @@ class MeasureTab(QWidget):
         self._disp_signals.error.connect(self._show_error)
         self._disp_signals.finished.connect(
             lambda: self.btn_disp.setEnabled(True))
+        self._disp_signals.image_ready.connect(self._open_disparity_window)
         signals = self._disp_signals
 
         def compute_and_show():
@@ -1582,9 +1630,7 @@ class MeasureTab(QWidget):
                     resize_h(panel_r, target_h),
                 ])
 
-                cv.imshow("AquaMeasure — Disparity & Rectification Check", composite)
-                cv.waitKey(0)
-                cv.destroyAllWindows()
+                signals.image_ready.emit(composite)
 
             except Exception as exc:
                 import traceback
@@ -1593,6 +1639,11 @@ class MeasureTab(QWidget):
                 signals.finished.emit()
 
         threading.Thread(target=compute_and_show, daemon=True).start()
+
+    def _open_disparity_window(self, bgr_image: np.ndarray):
+        """Ouvre la fenêtre de disparité dans le thread principal (Qt)."""
+        self._disp_win = DisparityWindow(bgr_image)
+        self._disp_win.show()
 
     # ── Nuage de points 3D ────────────────────────────────────────────────────
 
