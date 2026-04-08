@@ -1519,6 +1519,36 @@ class MeasureTab(QWidget):
         img_row.addWidget(self.img_right, stretch=1)
         layout.addLayout(img_row, stretch=1)
 
+        # ── Panneau résultat (sous les images) ───────────────────────────────
+        result_panel = QWidget()
+        result_panel.setStyleSheet(
+            "background:#111827; border-radius:6px; padding:4px;")
+        rp_layout = QVBoxLayout(result_panel)
+        rp_layout.setContentsMargins(12, 8, 12, 8)
+        rp_layout.setSpacing(3)
+
+        self.distance_label = QLabel()
+        self.distance_label.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        self.distance_label.setStyleSheet("color:#4ade80;")
+        self.distance_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.distance_label.hide()
+        rp_layout.addWidget(self.distance_label)
+
+        self.uncertainty_label = QLabel()
+        self.uncertainty_label.setFont(QFont("Segoe UI", 10))
+        self.uncertainty_label.setStyleSheet("color:#94a3b8;")
+        self.uncertainty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.uncertainty_label.hide()
+        rp_layout.addWidget(self.uncertainty_label)
+
+        self.precision_label = QLabel()
+        self.precision_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.precision_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.precision_label.hide()
+        rp_layout.addWidget(self.precision_label)
+
+        layout.addWidget(result_panel)
+
         # ── Slider ────────────────────────────────────────────────────────────
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 0)
@@ -1536,26 +1566,7 @@ class MeasureTab(QWidget):
         self.lbl_frame = QLabel("Frame: — / —")
         ctrl_row.addWidget(self.lbl_frame)
         ctrl_row.addStretch()
-
-        self.distance_label = QLabel()
-        self.distance_label.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        self.distance_label.setStyleSheet("color: #80e080;")
-        self.distance_label.hide()
-        ctrl_row.addWidget(self.distance_label)
         layout.addLayout(ctrl_row)
-
-        # ── Incertitude de mesure ─────────────────────────────────────────────
-        self.uncertainty_label = QLabel()
-        self.uncertainty_label.setFont(QFont("Segoe UI", 10))
-        self.uncertainty_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.uncertainty_label.hide()
-        layout.addWidget(self.uncertainty_label)
-
-        self.precision_label = QLabel()
-        self.precision_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        self.precision_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.precision_label.hide()
-        layout.addWidget(self.precision_label)
 
         # ── Timer lecture ─────────────────────────────────────────────────────
         self._timer = QTimer()
@@ -1752,48 +1763,51 @@ class MeasureTab(QWidget):
         p3dB = DLT(P1, P2, list(left_h[1]), list(right_h[1]))
         dist = np.linalg.norm(p3dB - p3dA)
 
-        self.distance_label.setText(f"Distance A→B : {dist:.1f} mm")
+        # ── Infos géométriques ────────────────────────────────────────────
+        f_px   = float(self.mtx1[0, 0])
+        B_mm   = float(abs(self.T[0, 0]))
+        z_A    = float(p3dA[2])
+        z_B    = float(p3dB[2])
+        z_mean = (z_A + z_B) / 2.0
+
+        # ── Incertitude empirique (précision de clic humain : 1.5 px) ────
+        CLICK_SIGMA_PX = 1.5
+        sigma_Z    = (z_mean ** 2) * CLICK_SIGMA_PX / max(f_px * B_mm, 1e-6)
+        sigma_dist = float(np.sqrt(2)) * sigma_Z
+        rel_err    = sigma_dist / max(dist, 1e-6)
+
+        self.distance_label.setText(
+            f"Distance A→B :  {dist:.1f} mm  ±  {sigma_dist:.1f} mm  (click precision)")
         self.distance_label.show()
 
-        # ── Estimation d'incertitude ───────────────────────────────────────
+        # Ligne RMSE stéréo séparée (indicateur qualité calibration)
         if self.stereo_rmse is not None:
-            f_px     = float(self.mtx1[0, 0])          # focale en pixels
-            B_mm     = float(abs(self.T[0, 0]))        # baseline en mm
-            z_A      = float(p3dA[2])
-            z_B      = float(p3dB[2])
-            z_mean   = (z_A + z_B) / 2.0
-
-            # Propagation d'erreur : σZ = Z² × rmse / (f × B)
-            sigma_Z        = (z_mean ** 2) * self.stereo_rmse / max(f_px * B_mm, 1e-6)
-            sigma_dist     = float(np.sqrt(2)) * sigma_Z
-            rel_err        = sigma_dist / max(dist, 1e-6)
-
-            self.distance_label.setText(
-                f"Distance A→B : {dist:.1f} mm  ±  {sigma_dist:.1f} mm")
-
-            self.uncertainty_label.setText(
-                f"Depth: ~{z_mean:.0f} mm  |  "
-                f"Focal: {f_px:.0f} px  |  "
-                f"Baseline: {B_mm:.1f} mm  |  "
-                f"Stereo RMSE: {self.stereo_rmse:.3f} px")
-            self.uncertainty_label.show()
-
-            if rel_err < 0.05:
-                color, tag = "#4caf50", "✓ High precision"
-            elif rel_err < 0.15:
-                color, tag = "#ff9800", "⚠ Medium precision"
-            else:
-                color, tag = "#f44336", "✗ Low precision — move cameras closer"
-
-            self.precision_label.setText(
-                f"<span style='color:{color};'>{tag}</span>  "
-                f"({rel_err*100:.1f}% relative uncertainty)  —  "
-                "Uncertainty increases with distance from cameras")
-            self.precision_label.setTextFormat(Qt.TextFormat.RichText)
-            self.precision_label.show()
+            rmse_part = f"Stereo RMSE: <b>{self.stereo_rmse:.1f} px</b> (calibration quality)"
         else:
-            self.uncertainty_label.hide()
-            self.precision_label.hide()
+            rmse_part = "Stereo RMSE: <i>N/A — recalibrate to display</i>"
+
+        self.uncertainty_label.setText(
+            f"Depth: ~{z_mean:.0f} mm  |  "
+            f"Focal: {f_px:.0f} px  |  "
+            f"Baseline: {B_mm:.1f} mm  |  "
+            f"A: {z_A:.0f} mm  B: {z_B:.0f} mm  |  "
+            + rmse_part)
+        self.uncertainty_label.setTextFormat(Qt.TextFormat.RichText)
+        self.uncertainty_label.show()
+
+        if rel_err < 0.05:
+            color, tag = "#4ade80", "● High precision"
+        elif rel_err < 0.15:
+            color, tag = "#fb923c", "● Medium precision"
+        else:
+            color, tag = "#f87171", "● Low precision — move cameras closer"
+
+        self.precision_label.setText(
+            f"<span style='color:{color};'><b>{tag}</b>  ({rel_err*100:.1f}%)</span>"
+            f"  —  ± based on {CLICK_SIGMA_PX}px click precision. "
+            "Stereo RMSE indicates calibration quality separately.")
+        self.precision_label.setTextFormat(Qt.TextFormat.RichText)
+        self.precision_label.show()
 
     def _update_hint(self):
         self.hint_label.setText(_STEPS[min(self._step, 4)])
