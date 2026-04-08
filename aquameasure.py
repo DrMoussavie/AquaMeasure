@@ -251,7 +251,11 @@ class CalibrationWorker(QObject):
             with open('camera_parameters/videos.txt', 'w') as f:
                 f.write(self.left_video  + '\n')
                 f.write(self.right_video + '\n')
-            self.log.emit("  Saved to camera_parameters/")
+            self.log.emit("  mtx1.npy  dist1.npy  → caméra gauche")
+            self.log.emit("  mtx2.npy  dist2.npy  → caméra droite")
+            self.log.emit("  R.npy  T.npy  F.npy  → stéréo (rotation, translation, fondamentale)")
+            self.log.emit("  videos.txt            → chemins des vidéos")
+            self.log.emit("✓ Paramètres enregistrés")
 
             # ── Sauvegarde des images de vérification ──────────────────────
             self.log.emit("")
@@ -280,11 +284,20 @@ class CalibrationWorker(QObject):
                     np.array([list(sz_l), list(sz_r)]))
 
             self.log.emit(
-                f"  {len(info_l)} left + {len(info_r)} right verify images saved")
+                f"  verify/left_XXXX.png   × {len(info_l)} frames gauche")
+            self.log.emit(
+                f"  verify/right_XXXX.png  × {len(info_r)} frames droite")
+            self.log.emit("  verify/corners_left/right.npy  → coins détectés")
+            self.log.emit("  verify/objpoints_left/right.npy → points 3D damier")
+            self.log.emit("  verify/image_sizes.npy          → résolutions")
+            self.log.emit("✓ Données de vérification enregistrées")
 
             self.progress.emit(100)
             self.log.emit("")
-            self.log.emit("✓ Calibration complete.")
+            self.log.emit("══════════════════════════════════════════════════")
+            self.log.emit("✓ Calibration terminée — tous les paramètres sont enregistrés.")
+            self.log.emit("  Redémarrez l'app : la calibration sera rechargée automatiquement.")
+            self.log.emit("══════════════════════════════════════════════════")
 
             # Émettre les données pour la grille de vérification
             self.verify_ready.emit({
@@ -1182,6 +1195,11 @@ class MeasureTab(QWidget):
 
         load_row.addStretch()
 
+        self.btn_disp = QPushButton("Show Disparity Map")
+        self.btn_disp.setEnabled(False)
+        self.btn_disp.clicked.connect(self._launch_disparity)
+        load_row.addWidget(self.btn_disp)
+
         self.btn_pc = QPushButton("Show 3D Point Cloud")
         self.btn_pc.setEnabled(False)
         self.btn_pc.clicked.connect(self._launch_pointcloud)
@@ -1333,6 +1351,7 @@ class MeasureTab(QWidget):
         self.btn_play.setEnabled(True)
         self.btn_reset.setEnabled(True)
         self.btn_pc.setEnabled(True)
+        self.btn_disp.setEnabled(True)
         self._reset_points()
         self.hint_label.show()
         self.status_label.hide()
@@ -1447,6 +1466,133 @@ class MeasureTab(QWidget):
         self.hint_label.setText(_STEPS[0])
         self.distance_label.hide()
         self.status_label.hide()
+
+    # ── Nuage de points 3D ────────────────────────────────────────────────────
+
+    # ── Disparity Map ─────────────────────────────────────────────────────────
+
+    def _launch_disparity(self):
+        if self._frame_left is None:
+            return
+        if self._playing:
+            self._show_error("Pause the video first")
+            return
+
+        self._show_status("Computing disparity map…")
+        self.btn_disp.setEnabled(False)
+
+        frame1 = self._frame_left.copy()
+        frame2 = self._frame_right.copy()
+        mtx1, dist1 = self.mtx1, self.dist1
+        mtx2, dist2 = self.mtx2, self.dist2
+        R, T = self.R, self.T
+
+        self._disp_signals = _PCSignals()
+        self._disp_signals.status.connect(self._show_status)
+        self._disp_signals.error.connect(self._show_error)
+        self._disp_signals.finished.connect(
+            lambda: self.btn_disp.setEnabled(True))
+        signals = self._disp_signals
+
+        def compute_and_show():
+            try:
+                h, w = frame1.shape[:2]
+                size = (w, h)
+
+                # ── 1. Rectification ─────────────────────────────────────────
+                R1, R2, P1r, P2r, Q, _, _ = cv.stereoRectify(
+                    mtx1, dist1, mtx2, dist2, size, R, T, alpha=0)
+                map1x, map1y = cv.initUndistortRectifyMap(
+                    mtx1, dist1, R1, P1r, size, cv.CV_32FC1)
+                map2x, map2y = cv.initUndistortRectifyMap(
+                    mtx2, dist2, R2, P2r, size, cv.CV_32FC1)
+                rect1 = cv.remap(frame1, map1x, map1y, cv.INTER_LINEAR)
+                rect2 = cv.remap(frame2, map2x, map2y, cv.INTER_LINEAR)
+
+                # ── 2. Disparity ──────────────────────────────────────────────
+                stereo = cv.StereoSGBM_create(
+                    minDisparity=0, numDisparities=128, blockSize=5,
+                    P1=8 * 3 * 25, P2=32 * 3 * 25,
+                    disp12MaxDiff=1, uniquenessRatio=10,
+                    speckleWindowSize=100, speckleRange=2,
+                    mode=cv.STEREO_SGBM_MODE_SGBM_3WAY)
+                disp_raw = stereo.compute(
+                    cv.cvtColor(rect1, cv.COLOR_BGR2GRAY),
+                    cv.cvtColor(rect2, cv.COLOR_BGR2GRAY),
+                ).astype(np.float32) / 16.0
+
+                # ── 3. Stats ─────────────────────────────────────────────────
+                valid_mask = disp_raw > 0
+                pct_valid  = 100.0 * valid_mask.sum() / disp_raw.size
+                d_min  = float(disp_raw[valid_mask].min())  if valid_mask.any() else 0
+                d_max  = float(disp_raw[valid_mask].max())  if valid_mask.any() else 0
+                d_mean = float(disp_raw[valid_mask].mean()) if valid_mask.any() else 0
+                signals.status.emit(
+                    f"Disparity — mean: {d_mean:.1f}px | "
+                    f"min: {d_min:.1f} | max: {d_max:.1f} | "
+                    f"valid pixels: {pct_valid:.1f}%")
+
+                # ── 4. Colormap TURBO (noir = invalide) ───────────────────────
+                disp_norm = np.zeros_like(disp_raw, dtype=np.uint8)
+                if valid_mask.any():
+                    cv.normalize(disp_raw, disp_norm, 0, 255,
+                                 cv.NORM_MINMAX, mask=valid_mask.astype(np.uint8))
+                disp_color = cv.applyColorMap(disp_norm, cv.COLORMAP_TURBO)
+                disp_color[~valid_mask] = (0, 0, 0)   # pixels invalides en noir
+
+                # ── 5. Lignes épipolaires horizontales ───────────────────────
+                def draw_epilines(img):
+                    out = img.copy()
+                    for y in range(0, h, 30):
+                        cv.line(out, (0, y), (w, y), (0, 220, 0), 1,
+                                cv.LINE_AA)
+                    return out
+
+                vis_l = draw_epilines(rect1)
+                vis_r = draw_epilines(rect2)
+
+                # ── 6. Composition côte à côte ───────────────────────────────
+                label_h = 28
+                def add_label(img, text):
+                    out = np.zeros((img.shape[0] + label_h, img.shape[1], 3),
+                                   dtype=np.uint8)
+                    out[label_h:] = img
+                    cv.putText(out, text, (8, 20),
+                               cv.FONT_HERSHEY_SIMPLEX, 0.65,
+                               (200, 200, 200), 1, cv.LINE_AA)
+                    return out
+
+                panel_l = add_label(vis_l,    "LEFT rectified + epipolar lines")
+                panel_c = add_label(disp_color, "DISPARITY MAP (turbo | black=invalid)")
+                panel_r = add_label(vis_r,    "RIGHT rectified + epipolar lines")
+
+                # Redimensionner à hauteur commune si nécessaire
+                target_h = panel_l.shape[0]
+                def resize_h(img, th):
+                    ratio = th / img.shape[0]
+                    return cv.resize(img,
+                                     (int(img.shape[1] * ratio), th),
+                                     interpolation=cv.INTER_LINEAR)
+
+                composite = np.hstack([
+                    resize_h(panel_l, target_h),
+                    np.full((target_h, 4, 3), 40, dtype=np.uint8),  # séparateur
+                    resize_h(panel_c, target_h),
+                    np.full((target_h, 4, 3), 40, dtype=np.uint8),
+                    resize_h(panel_r, target_h),
+                ])
+
+                cv.imshow("AquaMeasure — Disparity & Rectification Check", composite)
+                cv.waitKey(0)
+                cv.destroyAllWindows()
+
+            except Exception as exc:
+                import traceback
+                signals.error.emit(f"[DISP ERROR] {exc}\n{traceback.format_exc()}")
+            finally:
+                signals.finished.emit()
+
+        threading.Thread(target=compute_and_show, daemon=True).start()
 
     # ── Nuage de points 3D ────────────────────────────────────────────────────
 
