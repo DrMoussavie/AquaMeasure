@@ -562,6 +562,231 @@ class _PCSignals(QObject):
     image_ready = pyqtSignal(object)   # émet un np.ndarray BGR pour affichage Qt
 
 
+# ── Fenêtre DLT Depth Map ─────────────────────────────────────────────────────
+
+class DepthHoverWidget(QWidget):
+    """Carte de profondeur interactive : hover → profondeur en mm."""
+
+    depth_hover = pyqtSignal(float, int, int)   # (mm, x_orig, y_orig)
+    depth_leave = pyqtSignal()
+
+    def __init__(self, depth_colored: np.ndarray, depth_map: np.ndarray,
+                 points_rect: list | None = None, parent=None):
+        super().__init__(parent)
+        self._colored  = depth_colored   # BGR uint8
+        self._depth    = depth_map       # float32 mm
+        self._points   = points_rect or []
+        self._hover    = None            # (x_disp, y_disp)
+        self.setMouseTracking(True)
+        self.setMinimumSize(320, 240)
+
+    # ── Transformations ───────────────────────────────────────────────────────
+
+    def _transform(self):
+        h, w = self._colored.shape[:2]
+        s  = min(self.width() / w, self.height() / h)
+        ox = (self.width()  - w * s) / 2
+        oy = (self.height() - h * s) / 2
+        return s, ox, oy, w, h
+
+    def _to_orig(self, xd, yd):
+        s, ox, oy, w, h = self._transform()
+        return (max(0, min(int((xd - ox) / s), w - 1)),
+                max(0, min(int((yd - oy) / s), h - 1)))
+
+    def _to_disp(self, xo, yo):
+        s, ox, oy, *_ = self._transform()
+        return ox + xo * s, oy + yo * s
+
+    # ── Dessin ────────────────────────────────────────────────────────────────
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        s, ox, oy, ow, oh = self._transform()
+        dw, dh = int(ow * s), int(oh * s)
+
+        # Image
+        rgb  = cv.cvtColor(self._colored, cv.COLOR_BGR2RGB)
+        qimg = QImage(rgb.tobytes(), ow, oh, 3 * ow, QImage.Format.Format_RGB888)
+        pix  = QPixmap.fromImage(qimg).scaled(
+            QSize(dw, dh),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        painter.drawPixmap(int(ox), int(oy), pix)
+
+        # Points A / B (en rouge, coordonnées rectifiées)
+        for i, pt in enumerate(self._points):
+            if pt is None:
+                continue
+            dx, dy = self._to_disp(pt[0], pt[1])
+            r = 9
+            painter.setBrush(QBrush(QColor(220, 30, 30)))
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.drawEllipse(int(dx - r), int(dy - r), r * 2, r * 2)
+            painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            painter.setPen(QPen(QColor(255, 255, 255), 1))
+            painter.drawText(int(dx + r + 3), int(dy + 5), "AB"[i])
+
+        # Crosshair de hover (jaune)
+        if self._hover is not None:
+            hx, hy = self._hover
+            painter.setPen(QPen(QColor(255, 255, 0), 1, Qt.PenStyle.DashLine))
+            painter.drawLine(int(ox), hy, int(ox + dw), hy)
+            painter.drawLine(hx, int(oy), hx, int(oy + dh))
+
+        painter.end()
+
+    # ── Souris ────────────────────────────────────────────────────────────────
+
+    def mouseMoveEvent(self, event):
+        px, py = int(event.position().x()), int(event.position().y())
+        self._hover = (px, py)
+        xo, yo = self._to_orig(px, py)
+        d = float(self._depth[yo, xo])
+        self.depth_hover.emit(d, xo, yo)
+        self.update()
+
+    def leaveEvent(self, event):
+        self._hover = None
+        self.depth_leave.emit()
+        self.update()
+
+
+def _make_colorbar(d_min: float, d_max: float, d_mean: float,
+                   bar_h: int = 300) -> QWidget:
+    """Génère une colorbar verticale TURBO avec labels mm."""
+    bar_w = 28
+    margin_right = 58
+    pad_top = 16
+    canvas_h = bar_h + pad_top + 16
+    canvas_w = bar_w + margin_right
+
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    bar    = np.linspace(255, 0, bar_h, dtype=np.uint8).reshape(-1, 1)
+    bar    = cv.applyColorMap(np.tile(bar, (1, bar_w)), cv.COLORMAP_TURBO)
+    canvas[pad_top:pad_top + bar_h, :bar_w] = bar
+
+    font = cv.FONT_HERSHEY_SIMPLEX
+    def put(txt, y):
+        cv.putText(canvas, txt, (bar_w + 3, y), font, 0.38, (210, 210, 210), 1)
+
+    put(f"{d_max:.0f}mm",  pad_top + 10)
+    put(f"{d_mean:.0f}mm", pad_top + bar_h // 2)
+    put(f"{d_min:.0f}mm",  pad_top + bar_h)
+
+    lbl = QLabel()
+    lbl.setPixmap(_cv_to_pixmap(canvas))
+    lbl.setFixedSize(canvas_w, canvas_h)
+    return lbl
+
+
+class DepthMapWindow(QWidget):
+    """Fenêtre DLT-consistent Depth Map."""
+
+    def __init__(self, data: dict, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("AquaMeasure — DLT-consistent Depth Map")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setStyleSheet("background:#1e1e1e; color:#ddd;")
+
+        root = QVBoxLayout(self)
+        root.setSpacing(6)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        # ── Titre ─────────────────────────────────────────────────────────────
+        title = QLabel("<b>DLT-consistent Depth Map</b>  —  blue = far, red = close, black = invalid")
+        title.setFont(QFont("Segoe UI", 11))
+        title.setStyleSheet("color:#80c8ff;")
+        root.addWidget(title)
+
+        # ── Stats fixes ───────────────────────────────────────────────────────
+        s = data['stats']
+        stats_lbl = QLabel(
+            f"Min: <b>{s['min']:.0f} mm</b>   "
+            f"Max: <b>{s['max']:.0f} mm</b>   "
+            f"Mean: <b>{s['mean']:.0f} mm</b>   "
+            f"Center pixel: <b>{s['center']:.0f} mm</b>   "
+            f"Valid pixels: <b>{s['pct']:.1f}%</b>")
+        stats_lbl.setTextFormat(Qt.TextFormat.RichText)
+        root.addWidget(stats_lbl)
+
+        # ── Hover info ────────────────────────────────────────────────────────
+        self._hover_lbl = QLabel("Hover over the depth map to read depth in mm")
+        self._hover_lbl.setStyleSheet("color:#f0c060; font-size:11px;")
+        root.addWidget(self._hover_lbl)
+
+        # ── Panneaux ──────────────────────────────────────────────────────────
+        panels = QHBoxLayout()
+        panels.setSpacing(6)
+
+        # Gauche : frame rectifiée gauche (avec points si présents)
+        left_img = data['rect1'].copy()
+        for i, pt in enumerate(data['points_rect']):
+            if pt is None:
+                continue
+            cv.circle(left_img, (int(pt[0]), int(pt[1])), 9, (0, 0, 220), -1)
+            cv.circle(left_img, (int(pt[0]), int(pt[1])), 10, (255, 255, 255), 1)
+            cv.putText(left_img, "AB"[i], (int(pt[0]) + 13, int(pt[1]) + 6),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        left_lbl = QLabel("Rectified LEFT")
+        left_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left_lbl.setStyleSheet("color:#aaa; font-size:10px;")
+
+        left_col = QVBoxLayout()
+        left_col.addWidget(left_lbl)
+        left_img_lbl = QLabel()
+        left_img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left_img_lbl.setSizePolicy(
+            left_img_lbl.sizePolicy().horizontalPolicy(),
+            left_img_lbl.sizePolicy().verticalPolicy())
+        left_img_lbl.setPixmap(_cv_to_pixmap(left_img))
+        left_img_lbl.setScaledContents(True)
+        left_col.addWidget(left_img_lbl, stretch=1)
+        panels.addLayout(left_col, stretch=1)
+
+        # Droite : depth map interactive
+        right_lbl = QLabel("Depth Map (mm)")
+        right_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        right_lbl.setStyleSheet("color:#aaa; font-size:10px;")
+
+        self._depth_widget = DepthHoverWidget(
+            data['depth_colored'], data['depth_map'], data['points_rect'])
+        self._depth_widget.depth_hover.connect(self._on_hover)
+        self._depth_widget.depth_leave.connect(
+            lambda: self._hover_lbl.setText(
+                "Hover over the depth map to read depth in mm"))
+
+        right_col = QVBoxLayout()
+        right_col.addWidget(right_lbl)
+        right_col.addWidget(self._depth_widget, stretch=1)
+        panels.addLayout(right_col, stretch=1)
+
+        # Colorbar
+        panels.addWidget(
+            _make_colorbar(s['d_min_viz'], s['d_max_viz'], s['mean']))
+
+        root.addLayout(panels, stretch=1)
+
+        # Taille fenêtre
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1300, int(screen.width()  * 0.90)),
+                    min(700,  int(screen.height() * 0.85)))
+
+    def _on_hover(self, depth_mm: float, x: int, y: int):
+        if depth_mm > 0:
+            self._hover_lbl.setText(
+                f"Depth at pixel ({x}, {y}) :  <b>{depth_mm:.1f} mm</b>")
+        else:
+            self._hover_lbl.setText(f"({x}, {y}) — no depth data (invalid disparity)")
+        self._hover_lbl.setTextFormat(Qt.TextFormat.RichText)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+
 # ── Fenêtre de visualisation disparité ────────────────────────────────────────
 
 class DisparityWindow(QWidget):
@@ -1247,6 +1472,11 @@ class MeasureTab(QWidget):
         self.btn_disp.clicked.connect(self._launch_disparity)
         load_row.addWidget(self.btn_disp)
 
+        self.btn_depth = QPushButton("Show DLT Depth Map")
+        self.btn_depth.setEnabled(False)
+        self.btn_depth.clicked.connect(self._launch_depth_map)
+        load_row.addWidget(self.btn_depth)
+
         self.btn_pc = QPushButton("Show 3D Point Cloud")
         self.btn_pc.setEnabled(False)
         self.btn_pc.clicked.connect(self._launch_pointcloud)
@@ -1399,6 +1629,7 @@ class MeasureTab(QWidget):
         self.btn_reset.setEnabled(True)
         self.btn_pc.setEnabled(True)
         self.btn_disp.setEnabled(True)
+        self.btn_depth.setEnabled(True)
         self._reset_points()
         self.hint_label.show()
         self.status_label.hide()
@@ -1639,6 +1870,133 @@ class MeasureTab(QWidget):
                 signals.finished.emit()
 
         threading.Thread(target=compute_and_show, daemon=True).start()
+
+    # ── DLT Depth Map ─────────────────────────────────────────────────────────
+
+    def _launch_depth_map(self):
+        if self._frame_left is None:
+            return
+        if self._playing:
+            self._show_error("Pause the video first")
+            return
+
+        self._show_status("Computing DLT depth map…")
+        self.btn_depth.setEnabled(False)
+
+        frame1       = self._frame_left.copy()
+        frame2       = self._frame_right.copy()
+        mtx1, dist1  = self.mtx1, self.dist1
+        mtx2, dist2  = self.mtx2, self.dist2
+        R, T         = self.R, self.T
+        handles_left = self.img_left.get_handles()
+
+        self._depth_signals = _PCSignals()
+        self._depth_signals.status.connect(self._show_status)
+        self._depth_signals.error.connect(self._show_error)
+        self._depth_signals.finished.connect(
+            lambda: self.btn_depth.setEnabled(True))
+        self._depth_signals.image_ready.connect(self._open_depth_window)
+        signals = self._depth_signals
+
+        def compute():
+            try:
+                h, w = frame1.shape[:2]
+                size = (w, h)
+
+                # ── Rectification ──────────────────────────────────────────
+                R1, R2, P1r, P2r, Q, _, _ = cv.stereoRectify(
+                    mtx1, dist1, mtx2, dist2, size, R, T, alpha=0)
+                map1x, map1y = cv.initUndistortRectifyMap(
+                    mtx1, dist1, R1, P1r, size, cv.CV_32FC1)
+                map2x, map2y = cv.initUndistortRectifyMap(
+                    mtx2, dist2, R2, P2r, size, cv.CV_32FC1)
+                rect1 = cv.remap(frame1, map1x, map1y, cv.INTER_LINEAR)
+                rect2 = cv.remap(frame2, map2x, map2y, cv.INTER_LINEAR)
+
+                # ── Disparité ──────────────────────────────────────────────
+                stereo = cv.StereoSGBM_create(
+                    minDisparity=0, numDisparities=128, blockSize=5,
+                    P1=8 * 3 * 25, P2=32 * 3 * 25,
+                    disp12MaxDiff=1, uniquenessRatio=10,
+                    speckleWindowSize=100, speckleRange=2,
+                    mode=cv.STEREO_SGBM_MODE_SGBM_3WAY)
+                disp_raw = stereo.compute(
+                    cv.cvtColor(rect1, cv.COLOR_BGR2GRAY),
+                    cv.cvtColor(rect2, cv.COLOR_BGR2GRAY),
+                ).astype(np.float32) / 16.0
+
+                # ── Profondeur en mm via Q cohérent avec DLT ──────────────
+                # Q est produit par stereoRectify à partir de mtx1/2, R, T
+                # → cohérent avec les matrices de projection P1_dlt / P2_dlt
+                points_3d = cv.reprojectImageTo3D(disp_raw, Q)
+                depth_map = points_3d[:, :, 2].astype(np.float32)
+
+                # ── Stats ─────────────────────────────────────────────────
+                valid_mask  = disp_raw > 0
+                valid_d     = depth_map[valid_mask]
+                d_mean = float(valid_d.mean()) if valid_d.size else 0.0
+                d_min  = float(valid_d.min())  if valid_d.size else 0.0
+                d_max  = float(valid_d.max())  if valid_d.size else 0.0
+                pct    = 100.0 * valid_mask.sum() / disp_raw.size
+
+                cx, cy       = w // 2, h // 2
+                depth_center = float(depth_map[cy, cx]) if valid_mask[cy, cx] else 0.0
+
+                signals.status.emit(
+                    f"DLT depth — mean: {d_mean:.0f} mm | "
+                    f"min: {d_min:.0f} | max: {d_max:.0f} | "
+                    f"center: {depth_center:.0f} mm | valid: {pct:.1f}%")
+
+                # ── Visualisation (filtre outliers 3×mean) ─────────────────
+                viz_mask = valid_mask & (depth_map > 0) & (depth_map < d_mean * 3)
+                depth_viz = np.zeros_like(depth_map)
+                depth_viz[viz_mask] = depth_map[viz_mask]
+
+                depth_norm = cv.normalize(
+                    depth_viz, None, 0, 255, cv.NORM_MINMAX).astype(np.uint8)
+                depth_colored = cv.applyColorMap(depth_norm, cv.COLORMAP_TURBO)
+                depth_colored[~viz_mask] = (0, 0, 0)
+
+                d_min_viz = float(depth_viz[viz_mask].min()) if viz_mask.any() else 0.0
+                d_max_viz = float(depth_viz[viz_mask].max()) if viz_mask.any() else 0.0
+
+                # ── Transformer les handles gauche → coords rectifiées ─────
+                pts_rect = []
+                for handle in handles_left:
+                    if handle is None:
+                        pts_rect.append(None)
+                        continue
+                    pt_in = np.array(
+                        [[handle[0], handle[1]]], dtype=np.float32
+                    ).reshape(1, 1, 2)
+                    pt_out = cv.undistortPoints(pt_in, mtx1, dist1, R=R1, P=P1r)
+                    pts_rect.append(
+                        (float(pt_out[0, 0, 0]), float(pt_out[0, 0, 1])))
+
+                signals.image_ready.emit({
+                    'rect1':         rect1,
+                    'depth_map':     depth_map,
+                    'depth_colored': depth_colored,
+                    'points_rect':   pts_rect,
+                    'stats': {
+                        'min': d_min, 'max': d_max, 'mean': d_mean,
+                        'pct': pct,   'center': depth_center,
+                        'd_min_viz': d_min_viz, 'd_max_viz': d_max_viz,
+                    },
+                })
+
+            except Exception as exc:
+                import traceback
+                signals.error.emit(
+                    f"[DEPTH ERROR] {exc}\n{traceback.format_exc()}")
+            finally:
+                signals.finished.emit()
+
+        threading.Thread(target=compute, daemon=True).start()
+
+    def _open_depth_window(self, data: dict):
+        self._depth_win = DepthMapWindow(data)
+        self._depth_win.show()
 
     def _open_disparity_window(self, bgr_image: np.ndarray):
         """Ouvre la fenêtre de disparité dans le thread principal (Qt)."""
