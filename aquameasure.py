@@ -260,12 +260,25 @@ class CalibrationWorker(QObject):
             os.makedirs(verify_dir, exist_ok=True)
             for i, item in enumerate(info_l):
                 item['label'] = f"Left {i+1:03d}"
-                out = os.path.join(verify_dir, f"left_{i:04d}.png")
-                cv.imwrite(out, item['frame_annotated'])
+                cv.imwrite(os.path.join(verify_dir, f"left_{i:04d}.png"),
+                           item['frame_annotated'])
             for i, item in enumerate(info_r):
                 item['label'] = f"Right {i+1:03d}"
-                out = os.path.join(verify_dir, f"right_{i:04d}.png")
-                cv.imwrite(out, item['frame_annotated'])
+                cv.imwrite(os.path.join(verify_dir, f"right_{i:04d}.png"),
+                           item['frame_annotated'])
+
+            # Sauvegarde des coins et objpoints pour restauration au démarrage
+            np.save(os.path.join(verify_dir, 'corners_left.npy'),
+                    np.array([it['corners'] for it in info_l]))
+            np.save(os.path.join(verify_dir, 'corners_right.npy'),
+                    np.array([it['corners'] for it in info_r]))
+            np.save(os.path.join(verify_dir, 'objpoints_left.npy'),
+                    np.array(objpts_l))
+            np.save(os.path.join(verify_dir, 'objpoints_right.npy'),
+                    np.array(objpts_r))
+            np.save(os.path.join(verify_dir, 'image_sizes.npy'),
+                    np.array([list(sz_l), list(sz_r)]))
+
             self.log.emit(
                 f"  {len(info_l)} left + {len(info_r)} right verify images saved")
 
@@ -372,6 +385,99 @@ class CalibrationTab(QWidget):
         self._splitter.setSizes([300, 0])
 
         layout.addWidget(self._splitter, stretch=1)
+
+        # Restauration automatique si une calibration précédente existe
+        self._try_restore()
+
+    # ── Restauration au démarrage ─────────────────────────────────────────────
+
+    def _try_restore(self):
+        """Recharge la calibration précédente si les fichiers existent."""
+        required = [
+            'camera_parameters/mtx1.npy',  'camera_parameters/dist1.npy',
+            'camera_parameters/mtx2.npy',  'camera_parameters/dist2.npy',
+            'camera_parameters/R.npy',     'camera_parameters/T.npy',
+        ]
+        if any(not os.path.exists(f) for f in required):
+            return
+
+        self.log_area.append("✓ Previous calibration found in camera_parameters/")
+
+        # Restaurer les chemins vidéo
+        videos_txt = 'camera_parameters/videos.txt'
+        if os.path.exists(videos_txt):
+            try:
+                with open(videos_txt) as f:
+                    lines = [l.strip() for l in f.readlines()]
+                if len(lines) >= 2 and lines[0] and lines[1]:
+                    self._left_video  = lines[0]
+                    self._right_video = lines[1]
+                    self._lbl_left.setText(lines[0])
+                    self._lbl_right.setText(lines[1])
+                    self.log_area.append(f"  Left  : {lines[0]}")
+                    self.log_area.append(f"  Right : {lines[1]}")
+            except Exception:
+                pass
+
+        # Restaurer la grille de vérification
+        vdir = 'camera_parameters/verify'
+        cl   = os.path.join(vdir, 'corners_left.npy')
+        cr   = os.path.join(vdir, 'corners_right.npy')
+        ol   = os.path.join(vdir, 'objpoints_left.npy')
+        orr  = os.path.join(vdir, 'objpoints_right.npy')
+        sz   = os.path.join(vdir, 'image_sizes.npy')
+
+        if not all(os.path.exists(p) for p in (cl, cr, ol, orr, sz)):
+            self.log_area.append("  (No verify grid — run calibration to generate it)")
+            return
+
+        try:
+            corners_l  = np.load(cl)    # (N, K, 1, 2)
+            corners_r  = np.load(cr)
+            objpts_l   = list(np.load(ol))
+            objpts_r   = list(np.load(orr))
+            sizes      = np.load(sz).astype(int)
+            sz_l       = tuple(sizes[0])
+            sz_r       = tuple(sizes[1])
+
+            def load_side(corners_arr, prefix, side_name):
+                items = []
+                for i, c in enumerate(corners_arr):
+                    img_path = os.path.join(vdir, f"{prefix}_{i:04d}.png")
+                    if not os.path.exists(img_path):
+                        continue
+                    frame_ann = cv.imread(img_path, 1)
+                    if frame_ann is None:
+                        continue
+                    items.append({
+                        'path':            img_path,
+                        'frame':           frame_ann,
+                        'frame_annotated': frame_ann,
+                        'corners':         c.astype(np.float32),
+                        'label':           f"{side_name} {i+1:03d}",
+                    })
+                return items
+
+            info_l = load_side(corners_l, 'left',  'Left')
+            info_r = load_side(corners_r, 'right', 'Right')
+
+            self.log_area.append(
+                f"  Verify grid: {len(info_l)} left + {len(info_r)} right frames")
+
+            if info_l or info_r:
+                self._show_verify_grid({
+                    'left':             info_l,
+                    'right':            info_r,
+                    'objpoints_left':   objpts_l,
+                    'objpoints_right':  objpts_r,
+                    'image_size_left':  sz_l,
+                    'image_size_right': sz_r,
+                })
+        except Exception as exc:
+            import traceback
+            self.log_area.append(
+                f"  [RESTORE WARNING] Could not load verify grid: {exc}\n"
+                f"{traceback.format_exc()}")
 
     def _pick_video(self, side: str):
         path, _ = QFileDialog.getOpenFileName(
