@@ -179,7 +179,7 @@ class CalibrationWorker(QObject):
             cap = cv.VideoCapture(self.left_video)
             total = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
             cap.release()
-            N = max(1, total // 25)
+            N = max(1, total // 80)
             frame_indices = list(range(0, total, N))[:80]
             self.log.emit(
                 f"  Total frames: {total}  |  extracting {len(frame_indices)} "
@@ -358,15 +358,20 @@ class CalibrationTab(QWidget):
         self.log_area.setFont(QFont("Courier New", 9))
         self._splitter.addWidget(self.log_area)
 
-        # Placeholder pour la VerifyGrid (remplacé après calibration)
+        # Container pour la VerifyGrid — on y injecte le contenu après calibration
+        self._verify_container = QWidget()
+        self._verify_container_layout = QVBoxLayout(self._verify_container)
+        self._verify_container_layout.setContentsMargins(0, 0, 0, 0)
         self._verify_placeholder = QLabel(
             "La grille de vérification apparaîtra ici après la calibration.")
         self._verify_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._verify_placeholder.setStyleSheet("color:#888;")
-        self._splitter.addWidget(self._verify_placeholder)
+        self._verify_placeholder.setStyleSheet("color:#888; font-size:12px;")
+        self._verify_container_layout.addWidget(self._verify_placeholder)
+
+        self._splitter.addWidget(self._verify_container)
         self._splitter.setSizes([300, 0])
 
-        layout.addWidget(self._splitter)
+        layout.addWidget(self._splitter, stretch=1)
 
     def _pick_video(self, side: str):
         path, _ = QFileDialog.getOpenFileName(
@@ -407,12 +412,26 @@ class CalibrationTab(QWidget):
         self._thread.start()
 
     def _show_verify_grid(self, verify_data: dict):
-        grid = VerifyGrid(verify_data, self.log_area.append, parent=self)
-        # Remplace le placeholder dans le splitter
-        old = self._splitter.widget(1)
-        old.hide()
-        self._splitter.replaceWidget(1, grid)
-        self._splitter.setSizes([300, 450])
+        try:
+            # Vider le container (supprime le placeholder ou une ancienne grille)
+            while self._verify_container_layout.count():
+                item = self._verify_container_layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+
+            grid = VerifyGrid(verify_data, self.log_area.append,
+                              parent=self._verify_container)
+            self._verify_container_layout.addWidget(grid)
+
+            # Ouvrir le panneau bas du splitter
+            total = self._splitter.height()
+            top   = max(200, total - 450) if total > 300 else 300
+            self._splitter.setSizes([top, 450])
+            self._splitter.update()
+        except Exception as exc:
+            import traceback
+            self.log_area.append(f"[VERIFY ERROR] {exc}\n{traceback.format_exc()}")
 
 
 # ── Signaux thread → UI ────────────────────────────────────────────────────────
